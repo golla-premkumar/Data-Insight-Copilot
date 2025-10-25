@@ -2,298 +2,105 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import openai
+from openai import OpenAI
 import ast
 import io
 import sys
-from PIL import Image
 
-# Page config
-st.set_page_config(
-    page_title="Data-to-Insight Copilot",
-    page_icon="🤖",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="Data Copilot", page_icon="🤖", layout="wide")
 
-# Custom CSS
-st.markdown('''
-<style>
-    .main-header {
-        font-size: 3rem;
-        color: #1f77b4;
-        text-align: center;
-        margin-bottom: 0.5rem;
-    }
-    .sub-header {
-        font-size: 1.2rem;
-        color: #666;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .stButton>button {
-        width: 100%;
-        background-color: #1f77b4;
-        color: white;
-        font-size: 1.1rem;
-        padding: 0.75rem;
-        border-radius: 8px;
-    }
-</style>
-''', unsafe_allow_html=True)
+# CSS
+st.markdown('''<style>
+.main-header {font-size: 2.5rem; text-align: center; color: #1f77b4;}
+.chat-user {background: #e3f2fd; padding: 1rem; border-radius: 8px; margin: 0.5rem 0;}
+.chat-bot {background: #f5f5f5; padding: 1rem; border-radius: 8px; margin: 0.5rem 0;}
+</style>''', unsafe_allow_html=True)
 
-# Set OpenAI API key
-openai.api_key = st.secrets.get("OPENAI_API_KEY", "")
+# Init
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
+if 'df' not in st.session_state:
+    st.session_state.df = None
 
-# Functions
-def generate_python_eda(df):
-    prompt = f'''You are a pandas expert. Given this DataFrame:
+client = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY", ""))
 
-Columns: {list(df.columns)}
-Dtypes: {df.dtypes.to_dict()}
-Shape: {df.shape}
-Sample:
-{df.head(3).to_string()}
+def get_context(df):
+    return f"Columns: {list(df.columns)}\nShape: {df.shape}\nSample:\n{df.head(2).to_string()}"
 
-Generate Python code (pandas + matplotlib) that:
-1. Shows basic info (shape, dtypes, missing values)
-2. Creates ONE meaningful visualization
-3. Stores result in `result_df`
-4. Ends with `fig = plt.gcf()`
-
-Return ONLY code, no explanations.'''
-    
-    response = openai.ChatCompletion.create(
+def check_relevant(q, ctx):
+    r = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
+        messages=[{"role":"user","content":f"Dataset:{ctx}\n\nQuestion:{q}\n\nRelevant to data? YES/NO"}],
+        max_tokens=50
+    )
+    ans = r.choices[0].message.content
+    return ans.startswith("YES")
+
+def analyze(q, df, ctx):
+    if not check_relevant(q, ctx):
+        return {'msg': "🤔 That question isn't about this dataset. Try asking about the data!", 'code': None, 'fig': None, 'data': None}
+    
+    r = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role":"user","content":f"Dataset:{ctx}\n\nQ:{q}\n\nGenerate pandas+matplotlib code. Store in result_df, end with fig=plt.gcf()"}],
         max_tokens=800
     )
     
-    code = response['choices'][0]['message']['content'].strip()
-    if code.startswith("```python"):
-        code = code.replace("```python", "").replace("```", "").strip()
-    elif code.startswith("```"):
-        code = code.replace("```", "").strip()
-    return code
-
-def generate_query_code(df, question):
-    prompt = f'''Pandas expert. DataFrame:
-
-Columns: {list(df.columns)}
-Dtypes: {df.dtypes.to_dict()}
-Sample:
-{df.head(3).to_string()}
-
-Question: "{question}"
-
-Generate code: answer question, store in `result_df`, create chart, end with `fig = plt.gcf()`
-
-Return ONLY code.'''
+    code = r.choices[0].message.content.strip()
+    code = code.replace("```python","").replace("```","").strip()
     
-    response = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-        max_tokens=800
-    )
-    
-    code = response['choices'][0]['message']['content'].strip()
-    if code.startswith("```python"):
-        code = code.replace("```python", "").replace("```", "").strip()
-    elif code.startswith("```"):
-        code = code.replace("```", "").strip()
-    return code
-
-def safe_exec(code, df):
-    try:
-        tree = ast.parse(code)
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                module_name = node.names[0].name if hasattr(node, 'names') else getattr(node, 'module', '')
-                if module_name not in ['pandas', 'numpy', 'matplotlib.pyplot', 'matplotlib']:
-                    return {"error": f"Import '{module_name}' not allowed"}
-            if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name):
-                    if node.func.id in ['open', 'eval', 'exec', '__import__']:
-                        return {"error": f"Function '{node.func.id}' not allowed"}
-    except SyntaxError as e:
-        return {"error": f"Syntax error: {e}"}
-    
-    namespace = {
-        'pd': pd,
-        'np': np,
-        'plt': plt,
-        'df': df.copy(),
-        'result_df': None,
-        'fig': None
-    }
-    
-    old_stdout = sys.stdout
-    sys.stdout = captured_output = io.StringIO()
+    ns = {'pd':pd, 'np':np, 'plt':plt, 'df':df.copy(), 'result_df':None, 'fig':None}
     
     try:
-        exec(code, namespace)
-        output = captured_output.getvalue()
-        return {
-            'result_df': namespace.get('result_df'),
-            'fig': namespace.get('fig'),
-            'stdout': output,
-            'error': None
-        }
+        exec(code, ns)
+        return {'msg': "✅ Analysis complete!", 'code': code, 'fig': ns.get('fig'), 'data': ns.get('result_df')}
     except Exception as e:
-        return {
-            'result_df': None,
-            'fig': None,
-            'stdout': captured_output.getvalue(),
-            'error': str(e)
-        }
-    finally:
-        sys.stdout = old_stdout
+        return {'msg': f"❌ Error: {e}", 'code': code, 'fig': None, 'data': None}
 
-# Main app
+# UI
 st.markdown('<h1 class="main-header">🤖 Data-to-Insight Copilot</h1>', unsafe_allow_html=True)
-st.markdown('<p class="sub-header">AI-Powered Data Analysis Assistant</p>', unsafe_allow_html=True)
 
-# Sidebar
 with st.sidebar:
-    st.header("⚙️ Configuration")
+    st.header("📁 Upload Data")
+    f = st.file_uploader("CSV File", type=['csv'])
     
-    uploaded_file = st.file_uploader("📁 Upload CSV File", type=['csv'])
+    if f and st.session_state.df is None:
+        st.session_state.df = pd.read_csv(f)
+        st.success("✅ Loaded!")
     
-    st.divider()
-    
-    analysis_type = st.radio(
-        "📊 Analysis Mode",
-        ["EDA (Exploratory Data Analysis)", "Custom Query"],
-        help="Choose between automatic EDA or custom natural language queries"
-    )
-    
-    if analysis_type == "Custom Query":
-        question = st.text_area(
-            "💬 Your Question",
-            placeholder="e.g., What is the total revenue by region?",
-            height=100
-        )
-    else:
-        question = ""
-    
-    st.divider()
-    
-    analyze_button = st.button("🚀 Analyze Data", type="primary")
-    
-    st.divider()
-    
-    st.markdown('''
-    ### 💡 Example Questions
-    - "Show total sales by product"
-    - "What's the revenue trend over time?"
-    - "Compare performance by region"
-    - "Which category has highest profit?"
-    
-    ### 🔒 Security Features
-    - AST-based validation
-    - Sandboxed execution
-    - No file I/O allowed
-    - Only pandas/numpy/matplotlib
-    ''')
+    if st.session_state.df is not None:
+        st.metric("Rows", st.session_state.df.shape[0])
+        st.metric("Cols", st.session_state.df.shape[1])
+        
+        if st.button("🔄 Clear"):
+            st.session_state.messages = []
+            st.rerun()
 
-# Main content
-if uploaded_file is not None:
-    # Read CSV
-    df = pd.read_csv(uploaded_file)
-    
-    # Show dataset info
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("📊 Rows", df.shape[0])
-    with col2:
-        st.metric("📋 Columns", df.shape[1])
-    with col3:
-        st.metric("💾 Size", f"{uploaded_file.size / 1024:.1f} KB")
-    
-    with st.expander("🔍 Dataset Preview", expanded=True):
-        st.dataframe(df.head(10), use_container_width=True)
-        st.caption(f"Columns: {', '.join(df.columns.tolist())}")
-    
-    # Analyze button clicked
-    if analyze_button:
-        if analysis_type == "Custom Query" and not question.strip():
-            st.error("❌ Please enter a question for Custom Query mode!")
-        else:
-            with st.spinner("🤖 AI is generating code..."):
-                try:
-                    # Generate code
-                    if analysis_type == "EDA (Exploratory Data Analysis)":
-                        code = generate_python_eda(df)
-                    else:
-                        code = generate_query_code(df, question)
-                    
-                    # Execute code
-                    result = safe_exec(code, df)
-                    
-                    if result['error']:
-                        st.error(f"❌ **Error:**\n{result['error']}")
-                    else:
-                        st.success("✅ Analysis complete!")
-                        
-                        # Results tabs
-                        tab1, tab2, tab3 = st.tabs(["📊 Results", "🐍 Generated Code", "📈 Visualization"])
-                        
-                        with tab1:
-                            if result['stdout']:
-                                st.text("Console Output:")
-                                st.code(result['stdout'], language="text")
-                            
-                            if result['result_df'] is not None:
-                                st.subheader("📋 Result DataFrame")
-                                st.dataframe(result['result_df'], use_container_width=True)
-                        
-                        with tab2:
-                            st.code(code, language="python")
-                            st.caption("AI-generated pandas code")
-                        
-                        with tab3:
-                            if result['fig'] is not None:
-                                st.pyplot(result['fig'])
-                            else:
-                                st.info("No visualization generated")
-                
-                except Exception as e:
-                    st.error(f"❌ **Error:** {str(e)}")
-
+if st.session_state.df is None:
+    st.info("👈 Upload CSV to start")
 else:
-    # Empty state
-    st.info("👈 Upload a CSV file from the sidebar to get started!")
+    for m in st.session_state.messages:
+        if m['role'] == 'user':
+            st.markdown(f'<div class="chat-user">**You:** {m["q"]}</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="chat-bot">**🤖:** {m["msg"]}</div>', unsafe_allow_html=True)
+            if m.get('fig'):
+                st.pyplot(m['fig'])
+            if m.get('data') is not None:
+                with st.expander("Data"):
+                    st.dataframe(m['data'])
+            if m.get('code'):
+                with st.expander("Code"):
+                    st.code(m['code'])
     
-    st.markdown('''
-    ### 🚀 How to Use
+    q = st.chat_input("Ask about your data...")
     
-    1. **Upload a CSV file** using the sidebar
-    2. **Choose an analysis mode:**
-       - **EDA Mode:** Automatic exploratory analysis
-       - **Query Mode:** Ask questions in natural language
-    3. **Click "Analyze Data"** to see results
-    4. **View:**
-       - Analysis results and statistics
-       - AI-generated Python code
-       - Interactive visualizations
-    
-    ### ✨ Features
-    
-    - 🤖 AI-powered code generation (GPT-4o-mini)
-    - 📊 Automatic EDA with visualizations
-    - 💬 Natural language queries
-    - 🔒 Secure code execution
-    - 📈 Interactive charts
-    - 🎯 Professional pandas code examples
-    ''')
-
-# Footer
-st.divider()
-st.markdown('''
-<div style='text-align: center; color: #666; padding: 1rem;'>
-    Built with Streamlit, OpenAI GPT-4o-mini, Pandas & Matplotlib<br>
-    <a href='https://github.com/YOUR_USERNAME/data-insight-copilot' target='_blank'>View on GitHub</a>
-</div>
-''', unsafe_allow_html=True)
+    if q:
+        st.session_state.messages.append({'role':'user','q':q})
+        
+        with st.spinner("Thinking..."):
+            ctx = get_context(st.session_state.df)
+            res = analyze(q, st.session_state.df, ctx)
+            st.session_state.messages.append({'role':'bot','msg':res['msg'],'code':res['code'],'fig':res['fig'],'data':res['data']})
+        
+        st.rerun()
