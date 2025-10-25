@@ -22,40 +22,53 @@ if 'messages' not in st.session_state:
 if 'df' not in st.session_state:
     st.session_state.df = None
 
-client = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY", ""))
+# Safe client initialization
+try:
+    api_key = st.secrets.get("OPENAI_API_KEY", "")
+    if not api_key:
+        st.error("⚠️ OpenAI API key not found! Please add it in Streamlit Cloud Settings → Secrets")
+        st.stop()
+    client = OpenAI(api_key=api_key)
+except Exception as e:
+    st.error(f"Error initializing OpenAI: {e}")
+    st.stop()
 
 def get_context(df):
     return f"Columns: {list(df.columns)}\nShape: {df.shape}\nSample:\n{df.head(2).to_string()}"
 
 def check_relevant(q, ctx):
-    r = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role":"user","content":f"Dataset:{ctx}\n\nQuestion:{q}\n\nRelevant to data? YES/NO"}],
-        max_tokens=50
-    )
-    ans = r.choices[0].message.content
-    return ans.startswith("YES")
+    try:
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":f"Dataset:{ctx}\n\nQuestion:{q}\n\nRelevant to data? YES/NO"}],
+            max_tokens=50
+        )
+        ans = r.choices[0].message.content
+        return ans.startswith("YES")
+    except Exception as e:
+        st.error(f"Error checking relevance: {e}")
+        return True
 
 def analyze(q, df, ctx):
     if not check_relevant(q, ctx):
         return {'msg': "🤔 That question isn't about this dataset. Try asking about the data!", 'code': None, 'fig': None, 'data': None}
     
-    r = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role":"user","content":f"Dataset:{ctx}\n\nQ:{q}\n\nGenerate pandas+matplotlib code. Store in result_df, end with fig=plt.gcf()"}],
-        max_tokens=800
-    )
-    
-    code = r.choices[0].message.content.strip()
-    code = code.replace("```python","").replace("```","").strip()
-    
-    ns = {'pd':pd, 'np':np, 'plt':plt, 'df':df.copy(), 'result_df':None, 'fig':None}
-    
     try:
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":f"Dataset:{ctx}\n\nQ:{q}\n\nGenerate pandas+matplotlib code. Store in result_df, end with fig=plt.gcf()"}],
+            max_tokens=800
+        )
+        
+        code = r.choices[0].message.content.strip()
+        code = code.replace("```python","").replace("```","").strip()
+        
+        ns = {'pd':pd, 'np':np, 'plt':plt, 'df':df.copy(), 'result_df':None, 'fig':None}
+        
         exec(code, ns)
         return {'msg': "✅ Analysis complete!", 'code': code, 'fig': ns.get('fig'), 'data': ns.get('result_df')}
     except Exception as e:
-        return {'msg': f"❌ Error: {e}", 'code': code, 'fig': None, 'data': None}
+        return {'msg': f"❌ Error: {e}", 'code': None, 'fig': None, 'data': None}
 
 # UI
 st.markdown('<h1 class="main-header">🤖 Data-to-Insight Copilot</h1>', unsafe_allow_html=True)
